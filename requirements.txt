@@ -1,0 +1,7 @@
+anthropic>=0.40
+python-docx>=1.1
+pypdf>=4.0
+# optional: read listings from sites that load with JavaScript
+#   pip install playwright && playwright install chromium
+# optional: PDF export via Microsoft Word if LibreOffice isn't installed
+#   pip install docx2pdf

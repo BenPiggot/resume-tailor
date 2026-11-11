@@ -1,0 +1,39 @@
+# resume-tailor settings. Every value is optional; command-line flags override these.
+
+# Your master resume: a .md file (best), or a .pdf or .docx, e.g. "~/Documents/My_Resume.pdf"
+base_resume = "base_resume.md"
+
+# Where application folders are created when you don't pass --out.
+output_root = "~/Job Applications"
+
+# Cover letters: "auto" = only when the listing asks for or accepts one,
+# "yes" = always, "no" = never.  (-c / -n on the command line override this per job.)
+cover_letter = "auto"
+
+# ---- Naming -------------------------------------------------------------
+# Placeholders: {name} {first} {last} {company} {role} {date} {doc}
+# {doc} is resume_label or cover_letter_label below, and file_name must include it.
+# A "/" in folder_name makes subfolders, e.g. "{company}/{date}_{role}".
+folder_name = "{date}_{company}_{role}"
+file_name   = "{name}_{company}_{doc}"
+# Examples:
+#   file_name = "{name} - {doc} - {company}"    -> Jordan_Rivera - Resume - Acme_Corp.pdf
+#   file_name = "{last}_{doc}"                  -> Rivera_Resume.pdf
+date_format = "%Y-%m-%d"           # e.g. "%b %d %Y" for "Nov 11 2026"
+space = "_"                        # what replaces spaces inside names; use " " to keep spaces
+resume_label = "Resume"
+cover_letter_label = "Cover Letter"
+
+# ---- Model and output -----------------------------------------------------
+# claude-sonnet-5-5 is fast and inexpensive; claude-opus-5-5 is the most capable.
+model = "claude-sonnet-5-5"
+
+# Output files to keep: any of "docx", "pdf", "md"
+formats = ["docx", "pdf"]
+
+font = "Calibri"
+font_size = 10.5
+
+# Standing guidance applied to every application, e.g.
+# extra_instructions = "Keep it to one page. I'm open to relocation; don't mention it unless relevant."
+extra_instructions = ""
