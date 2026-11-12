@@ -4,10 +4,8 @@ This tool tailors your master resume to a specific job posting, and can write a 
 
 ```
 ~/Job Applications/2026-11-11_Northwind_Logistics_Senior_Backend_Engineer/
-├── Jordan_Rivera_Northwind_Logistics_Resume.docx
 ├── Jordan_Rivera_Northwind_Logistics_Resume.pdf
-├── Jordan_Rivera_Northwind_Logistics_Cover_Letter.docx   (when a cover letter is written)
-├── Jordan_Rivera_Northwind_Logistics_Cover_Letter.pdf
+├── Jordan_Rivera_Northwind_Logistics_Cover_Letter.pdf    (when a cover letter is written)
 ├── tailoring_notes.md      ← what was emphasized, keywords matched, honest gaps
 ├── job_description.txt     ← a copy of the posting, in case it's taken down later
 └── .source/               ← editable .md sources (see "Tweak and re-render")
@@ -29,16 +27,37 @@ The tool **never invents experience**. It reorders, rephrases and trims what is 
    export ANTHROPIC_API_KEY=sk-ant-...        # macOS/Linux: add this to ~/.zshrc or ~/.bashrc
    setx ANTHROPIC_API_KEY "sk-ant-..."        # Windows: run once, then open a new terminal
    ```
-3. **For PDF output**, install [LibreOffice](https://www.libreoffice.org/download/), which is free. Without LibreOffice, run `pip install docx2pdf` to use Microsoft Word for the conversion instead. If neither is installed, you still get the .docx files.
+3. **Install [LibreOffice](https://www.libreoffice.org/download/)** (free). The tool uses it to make the PDFs. If you have Microsoft Word, you can run `pip install docx2pdf` instead. If neither is installed, the tool saves Word (.docx) files in place of the PDFs. To also keep an editable Word copy, set `formats = ["pdf", "docx"]` in `config.toml`.
 4. **Add your resume.** Either edit `base_resume.md` directly (it holds a sample), or import your Word resume:
    ```bash
    python tailor.py import ~/Documents/My_Resume.docx --force
    ```
    Then open `base_resume.md` and check that its structure matches the format below.
 
-   **Or just use your PDF or Word file as is.** Set `base_resume = "~/Documents/My_Resume.pdf"` in `config.toml`, or pass `--base My_Resume.pdf` on a run. The tool extracts the text on every run, and Claude puts it back into the resume layout. This works well for ordinary text-based PDFs. It can go wrong with two-column or table-heavy designs, and it doesn't work with scanned images. If dates or sections come out jumbled, run the `import` command once and use the Markdown file instead.
+   **Or use your PDF or Word file as is.** Set `base_resume = "~/Documents/My_Resume.pdf"` in `config.toml`, or pass `--base My_Resume.pdf` on a run. With a PDF, the tailored resume keeps your PDF's design (see below).
 
-### Base resume format
+### Keeping your PDF's design
+
+If your resume is a PDF, set `base_resume = "~/Documents/My_Resume.pdf"` in `config.toml`. The tailored resume then **keeps your PDF's exact layout**: fonts, sizes, colors, columns, sidebars, lines and spacing all stay the same, and only the wording changes.
+
+How it works:
+- The tool splits your PDF into text slots: each bullet, paragraph, skills line and so on.
+- Claude rewrites the slots that matter for the job, keeping each one within the room it has on the page.
+- The tool removes only the text that changed, and writes the new text into the same spot in the same font, size and color. Everything else in the PDF stays exactly as it was.
+- Your name, contact details, job titles, companies and dates are locked, so they can't change.
+
+There are a few limits, since the layout is fixed:
+- **Colored tags are kept.** If parts of a bullet are in a different color or style, such as tech tags like "(React, TypeScript)", rewritten bullets keep that styling.
+- **Text can't grow beyond its space.** A one-line bullet stays one line. If Claude's wording is too long, the tool asks Claude to shorten it. If it's still too long after that, the text is set slightly smaller.
+- **Bullets can't be added or removed.** Each job keeps the same number of bullets, but Claude can reorder them and rewrite their text.
+- **Fonts:** the tool uses your resume's font if it's installed on your computer. Otherwise it uses a font with identical character widths, such as Arial for Liberation Sans or Calibri for Carlito, so text fits exactly the same. Failing that, it uses the copy of the font embedded in your PDF, and as a last resort a similar standard font. It tells you when it had to use a stand-in.
+- **Scanned PDFs** (a picture of text) can't be used. The tool falls back to the standard layout and tells you.
+
+To fix wording by hand afterwards, edit the text in `.source/<file>.edits.json`, then run `python tailor.py render <that file>`. The `--simple` flag uses the standard layout instead for a single run.
+
+If your master content is a longer `.md` file, set `template_pdf` to the PDF whose look you want. Claude can then draw on the extra bullets in the `.md` file while the result keeps the PDF's design.
+
+### Base resume format (for .md files)
 
 ```markdown
 # Your Name
@@ -77,6 +96,7 @@ python tailor.py job posting.txt -i "Emphasize people leadership; I was the de-f
 | `-o`, `--out DIR` | save into exactly this folder |
 | `--name "..."` / `--folder-name "..."` | naming patterns for this run (see [Naming](#naming)) |
 | `-i "..."` | extra instructions for this application |
+| `--template X.pdf` / `--simple` | copy a specific PDF's layout / use the standard layout |
 | `--model` | e.g. `claude-opus-5-5` for the most capable model |
 | `--formats docx,pdf,md` | which files to keep |
 | `--open` | open the folder when done |
@@ -103,14 +123,36 @@ python tailor.py fetch https://jobs.lever.co/acme/1234 --save job.txt
 
 ### Cover letters: written only when needed
 
-By default (`cover_letter = "auto"` in `config.toml`), Claude writes a cover letter only when the listing asks for or accepts one. That means it mentions a cover letter, a letter of interest or a motivation letter, or asks why you're interested. The terminal shows the decision and the reason, and they are also saved in `tailoring_notes.md`.
+By default (`cover_letter = "auto"` in `config.toml`), Claude writes a cover letter only when the listing asks for or accepts one. That means it mentions a cover letter, a letter of interest or a motivation letter, or asks why you're interested. The terminal shows the decision and the reason, and they are also saved in `tailoring_notes.md`. To always get one, use `-c`; to never get one, use `-n`.
 
-- To always get one, use `-c`; to never get one, use `-n`. Or set `cover_letter = "yes"` or `"no"` in `config.toml`.
-- **To add one later** to an application that skipped it:
-  ```bash
-  python tailor.py letter "~/Job Applications/2026-11-11_Acme_Corp_Backend_Engineer"
-  ```
-  This uses that folder's tailored resume and saved job description, so nothing gets fetched again.
+The cover letter is a PDF in the same font, name style and contact line as your resume. It's created directly by the tool, so you don't need LibreOffice or Word for it.
+
+- **To add one later** to an application that skipped it: `python tailor.py letter atlassian`
+- **To start the letter over:** `python tailor.py letter atlassian --new`
+
+### Improving the cover letter with your feedback
+
+```bash
+# one change at a time
+python tailor.py revise atlassian "warmer opening; mention I volunteer teaching Python at Code.org"
+
+# or a back-and-forth session: see the letter, say what to change, repeat
+python tailor.py revise atlassian --open
+```
+
+**Naming the application:** you don't need the full path. `atlassian` matches any folder under your output folder with "atlassian" in its name, and `latest` means the most recent application. A full folder name or path also works. The same goes for `letter`.
+
+In the back-and-forth session, type what you'd like changed, and Claude revises the letter and updates the PDF. Use `--open` to have the PDF open after each change. These commands also work there:
+- `show` reprints the current letter
+- `undo` goes back to the previous version
+- `versions` lists all versions
+- `done`, or just pressing Enter, finishes
+
+**Adding facts:** you can tell it things about yourself that aren't on your resume, such as "I used Jira daily at Cellar Door", and they'll be worked in. Otherwise, the letter sticks to your resume and the listing.
+
+**Feedback builds up:** each revision keeps your earlier requests, so asking for "shorter" won't undo "mention Code.org". If you undo a change, its feedback is dropped too.
+
+**Every version is saved** in `.source/cover_letter_versions/`. Use `revise <folder> --list` to see them, and `revise <folder> --use 3` to bring back version 3.
 
 ## Naming
 
@@ -140,7 +182,7 @@ To change something by hand, edit the `.md` file in the application's `.source/`
 ```bash
 python tailor.py render "~/Job Applications/.../.source/Jordan_Rivera_Acme_Corp_Resume.md"
 ```
-This rebuilds the .docx and .pdf without calling the API.
+This rebuilds the PDF without calling the API.
 
 ## Settings
 

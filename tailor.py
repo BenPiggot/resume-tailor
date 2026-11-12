@@ -28,8 +28,10 @@ DEFAULT_CONFIG = {
     "base_resume": str(HERE / "base_resume.md"),
     "output_root": "~/Job Applications",
     "model": "claude-sonnet-5-5",
-    "formats": ["docx", "pdf"],
+    "formats": ["pdf"],
     "cover_letter": "auto",
+    "match_layout": True,
+    "template_pdf": "",
     "folder_name": "{date}_{company}_{role}",
     "file_name": "{name}_{company}_{doc}",
     "date_format": "%Y-%m-%d",
@@ -291,9 +293,7 @@ Reply with exactly these XML blocks and nothing else:
 keywords matched, and honest gaps the candidate may want to address.</notes>"""
 
 
-def call_claude(base_resume: str, job: str, cover_letter: str, cfg: dict, extra: str,
-                letter_only: bool = False) -> dict:
-    """cover_letter is "YES", "NO" or "AUTO"."""
+def _ask(system: str, user: str, cfg: dict, label: str) -> str:
     try:
         import anthropic
     except ImportError:
@@ -301,6 +301,111 @@ def call_claude(base_resume: str, job: str, cover_letter: str, cfg: dict, extra:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("Set your API key first:  export ANTHROPIC_API_KEY=sk-ant-...  "
                  "(get one at https://console.anthropic.com)")
+    print(f"{label} with {cfg['model']}…", flush=True)
+    with anthropic.Anthropic().messages.stream(
+        model=cfg["model"], max_tokens=16000, system=system,
+        messages=[{"role": "user", "content": user}],
+    ) as stream:
+        msg = stream.get_final_message()
+    return "".join(b.text for b in msg.content if b.type == "text")
+
+
+LAYOUT_PROMPT = """You are an expert resume writer. The candidate's resume is a designed PDF whose \
+layout must stay exactly as it is. It has been split into numbered text slots. You tailor the \
+resume to a job posting by rewriting the text of some slots; the new text is typeset into the \
+same place, font and size.
+
+Hard rules:
+- Use ONLY facts in the resume (and the master resume, if one is given). Never invent employers, \
+titles, dates, degrees, tools, metrics or accomplishments. Rephrase, reorder and choose emphasis.
+- Never change LOCKED slots (name, contact details, job titles, companies, dates). Leave section \
+headings unchanged.
+- Respect each slot's length: stay within its max characters, and for multi-line slots use at \
+least the minimum so the lines are filled (an empty line looks broken).
+- A slot's text replaces only that slot. To reorder bullets within a job, write bullet A's text \
+into bullet B's slot and vice versa, keeping each within its slot's limits. Keep bullets under \
+the job they belong to; never move achievements between employers.
+- Don't empty a slot unless it's irrelevant filler; if you do, return "" for it.
+- Mirror the posting's terminology where it truthfully applies. No first person, no filler.
+- Text inside ⟦ ⟧ is printed in the slot's secondary style (usually colored tech tags such as \
+⟦(React, TypeScript)⟧). Keep that convention: when a slot has ⟦ ⟧ text, keep the tag in ⟦ ⟧ at \
+the same place (usually the end, before the final period), listing only technologies actually \
+used in that work. Never put ⟦ ⟧ in slots that don't have it. The tag counts toward the length.
+
+Whether to write a cover letter is given as YES, NO or AUTO. For AUTO, write one only if the \
+posting asks for or accepts one (mentions a cover letter, letter of interest, motivation letter, \
+or asks why the applicant is interested). Cover letter: 250-400 words, plain paragraphs, no \
+address block, start "Dear Hiring Manager," unless a name is given, end "Sincerely," and the \
+candidate's name. Never invent facts.
+
+Reply with exactly these XML blocks and nothing else:
+<company>Company name from the posting, or Unknown</company>
+<role>Job title from the posting</role>
+<edits>JSON object mapping slot ids to new text, ONLY for slots you change, e.g. {"u7": "..."}</edits>
+<cover_letter_decision>"written" or "skipped", then a short reason</cover_letter_decision>
+<cover_letter>...or empty...</cover_letter>
+<notes>Markdown: top requirements from the posting, what you emphasized and why, keywords \
+matched, and honest gaps.</notes>"""
+
+
+def _json_obj(text: str) -> dict:
+    import json
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text).strip()
+    try:
+        d = json.loads(text)
+        return {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                return {str(k): str(v) for k, v in json.loads(m.group(0)).items()}
+            except Exception:
+                pass
+    return {}
+
+
+def call_claude_layout(tpl, master: str | None, job: str, cover_letter: str, cfg: dict, extra: str) -> dict:
+    instructions = "\n".join(x for x in [cfg.get("extra_instructions", ""), extra] if x)
+    user = (
+        (f"<master_resume>\n{master}\n</master_resume>\n(Extra material you may draw from, "
+         "e.g. bullets not on the PDF.)\n\n" if master else "")
+        + f"<resume_slots>\n{tpl.listing()}\n</resume_slots>\n\n"
+        f"<job_posting>\n{job}\n</job_posting>\n\n"
+        f"Write a cover letter: {cover_letter}\n"
+        + (f"\nAdditional instructions from the candidate:\n{instructions}\n" if instructions else "")
+    )
+    text = _ask(LAYOUT_PROMPT, user, cfg, "Tailoring (keeping your PDF layout)")
+    res = parse_response(text, require_resume=False)
+    m = re.search(r"<edits>(.*?)</edits>", text, re.S)
+    res["edits"] = _json_obj(m.group(1)) if m else {}
+    if not m:
+        sys.exit("Claude's reply didn't contain the edits. Raw reply:\n\n" + text[:2000])
+    known = {u.id for u in tpl.units}
+    locked = {u.id for u in tpl.units if u.protected}
+    dropped = [k for k in res["edits"] if k in locked]
+    res["edits"] = {k: v for k, v in res["edits"].items() if k in known and k not in locked}
+    if dropped:
+        print(f"  (kept locked text unchanged: {', '.join(dropped)})")
+    res["resume"] = tpl.as_markdown(res["edits"])
+    return res
+
+
+def shorten_overflow(tpl, edits: dict, overflow: dict, cfg: dict) -> dict:
+    by_id = {u.id: u for u in tpl.units}
+    items = "\n".join(f"[{k}] (max {cap} chars) {edits[k]}" for k, cap in overflow.items())
+    text = _ask("You shorten resume lines to fit a fixed layout. Keep every fact and keyword that "
+                "matters, never add facts. Keep any ⟦...⟧ tag markers (they mark colored text). "
+                "Reply with only a JSON object mapping each id to its shortened text.",
+                f"These texts are too long for their slots. Rewrite each to at most its max "
+                f"characters:\n{items}", cfg, "Fitting text to your layout")
+    fixed = _json_obj(text)
+    return {**edits, **{k: v for k, v in fixed.items() if k in by_id and k in overflow}}
+
+
+def call_claude(base_resume: str, job: str, cover_letter: str, cfg: dict, extra: str,
+                letter_only: bool = False) -> dict:
+    """cover_letter is "YES", "NO" or "AUTO"."""
     instructions = "\n".join(x for x in [cfg.get("extra_instructions", ""), extra] if x)
     user = (
         f"<base_resume>\n{base_resume}\n</base_resume>\n\n"
@@ -310,16 +415,7 @@ def call_claude(base_resume: str, job: str, cover_letter: str, cfg: dict, extra:
            "already tailored to this job.\n" if letter_only else "")
         + (f"\nAdditional instructions from the candidate:\n{instructions}\n" if instructions else "")
     )
-    client = anthropic.Anthropic()
-    print(f"{'Writing cover letter' if letter_only else 'Tailoring'} with {cfg['model']}…", flush=True)
-    with client.messages.stream(
-        model=cfg["model"],
-        max_tokens=16000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user}],
-    ) as stream:
-        msg = stream.get_final_message()
-    text = "".join(b.text for b in msg.content if b.type == "text")
+    text = _ask(SYSTEM_PROMPT, user, cfg, "Writing cover letter" if letter_only else "Tailoring")
     return parse_response(text, require_resume=not letter_only)
 
 
@@ -389,6 +485,9 @@ def _header_block(doc, name: str, contact: str, cfg: dict):
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = p.add_run(name); r.bold = True; r.font.size = Pt(cfg["font_size"] + 8)
+    if cfg.get("accent"):
+        from docx.shared import RGBColor
+        r.font.color.rgb = RGBColor(*[int(round(c * 255)) for c in cfg["accent"]])
     p.paragraph_format.space_after = Pt(1)
     if contact:
         p = doc.add_paragraph()
@@ -552,6 +651,8 @@ def docx_to_markdown(path: Path) -> str:
 
 def name_fields(cfg: dict, resume_md: str, company: str, role: str) -> dict:
     full = split_header(resume_md)[0] or "Resume"
+    if full.isupper():  # "BEN PIGGOT" on the resume -> "Ben_Piggot" in file names
+        full = full.title()
     parts = full.split()
     return {"name": full, "first": parts[0] if parts else full, "last": parts[-1] if len(parts) > 1 else "",
             "company": company, "role": role, "date": dt.date.today().strftime(cfg["date_format"])}
@@ -592,21 +693,31 @@ def read_base(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
-def write_doc(out: Path, stem: str, md: str, build, formats: list[str]) -> list[str]:
+def write_doc(out: Path, stem: str, md: str, build, formats: list[str], cfg: dict | None = None) -> list[str]:
     """Build stem.docx (and .pdf), keep or tuck away the .md source. Returns file names written."""
     written = []
     docx_path = out / f"{stem}.docx"
     build(docx_path)
     if "docx" in formats:
         written.append(docx_path.name)
+    pdf_ok = False
     if "pdf" in formats:
         pdf = docx_to_pdf(docx_path)
+        if not pdf:  # no LibreOffice/Word: build the PDF directly
+            try:
+                import pdf_template
+                pdf_template.markdown_resume_pdf(md, out / f"{stem}.pdf", cfg or DEFAULT_CONFIG)
+                pdf = out / f"{stem}.pdf"
+            except Exception as e:
+                print(f"  ! Couldn't make a PDF ({e}).")
         if pdf:
-            written.append(pdf.name)
-        else:
-            print("  ! PDF skipped: install LibreOffice (or `pip install docx2pdf` with MS Word) to enable it.")
+            written.append(pdf.name); pdf_ok = True
     if "docx" not in formats:
-        docx_path.unlink(missing_ok=True)
+        if pdf_ok or "pdf" not in formats:
+            docx_path.unlink(missing_ok=True)
+        else:  # never leave you with nothing: keep the Word file when PDF conversion fails
+            written.append(docx_path.name)
+            print(f"    Kept {docx_path.name} instead.")
     if "md" in formats:
         (out / f"{stem}.md").write_text(md + "\n", encoding="utf-8")
         written.append(f"{stem}.md")
@@ -625,18 +736,65 @@ def cover_mode(args, cfg) -> str:
     return mode if mode in ("YES", "NO", "AUTO") else "AUTO"
 
 
+def load_layout_template(args, cfg, base_path: Path):
+    """The PDF whose layout the tailored resume should copy, or None for the simple layout."""
+    if getattr(args, "simple", False) or not cfg.get("match_layout", True):
+        return None
+    path = getattr(args, "template", None) or cfg.get("template_pdf") or (
+        str(base_path) if base_path.suffix.lower() == ".pdf" else "")
+    if not path:
+        return None
+    path = Path(path).expanduser().resolve()
+    if not path.exists():
+        sys.exit(f"Layout template not found: {path}")
+    import pdf_template
+    tpl = pdf_template.Template(path)
+    editable = [u for u in tpl.units if not u.protected]
+    if len(editable) < 4 or sum(len(u.text) for u in tpl.units) < 300:
+        print(f"  ! Couldn't read enough text from {path.name} to reuse its layout (is it a scanned "
+              f"image?). Using the standard layout instead.")
+        return None
+    return tpl
+
+
+def write_layout_pdf(out: Path, stem: str, tpl, edits: dict, cfg: dict) -> list[str]:
+    import json
+    pdf = out / f"{stem}.pdf"
+    overflow = tpl.render(edits, pdf)
+    if overflow:
+        edits = shorten_overflow(tpl, edits, overflow, cfg)
+        overflow = tpl.render(edits, pdf)
+        if overflow:
+            print(f"  ! {len(overflow)} line(s) were still long and were set slightly smaller to fit.")
+    if getattr(tpl, "missing_fonts", None):
+        print(f"  ! Font(s) not installed on this computer: {', '.join(tpl.missing_fonts)}. Changed text "
+              f"used the font embedded in your PDF or a close look-alike. Install the font(s) for an exact match.")
+    (out / ".source").mkdir(exist_ok=True)
+    (out / ".source" / f"{stem}.edits.json").write_text(json.dumps(
+        {"template": tpl.path, "edits": edits,
+         "original": {u.id: u.text for u in tpl.units if u.id in edits}}, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    return [pdf.name]
+
+
 def cmd_job(args, cfg):
     base_path = Path(args.base or cfg["base_resume"]).expanduser()
     if not base_path.exists():
         sys.exit(f"Base resume not found at {base_path}.\n"
                  f"Create it, or run:  python tailor.py import your_resume.docx")
-    base = read_base(base_path)
+    tpl = load_layout_template(args, cfg, base_path)
+    base = None if (tpl and Path(tpl.path) == base_path.resolve()) else read_base(base_path)
     job = read_job(args.source)
     if len(job.strip()) < 50:
         sys.exit("The job description looks empty.")
 
     mode = cover_mode(args, cfg)
-    res = call_claude(base, job, mode, cfg, args.instructions or "")
+    if tpl:
+        res = call_claude_layout(tpl, base, job, mode, cfg, args.instructions or "")
+        letter_cfg = {**cfg, **tpl.body_style()}  # cover letter in the same font/size/accent color
+    else:
+        res = call_claude(base, job, mode, cfg, args.instructions or "")
+        letter_cfg = cfg
     company, role = res["company"] or "Unknown", res["role"] or "Role"
 
     fields = name_fields(cfg, res["resume"], company, role)
@@ -667,20 +825,25 @@ def cmd_job(args, cfg):
         + (f"\n## Cover letter\n{decision}\n" if decision else ""), encoding="utf-8")
     written = ["job_description.txt", "tailoring_notes.md"]
 
-    written += write_doc(out, resume_stem, res["resume"],
-                         lambda p: resume_md_to_docx(res["resume"], p, cfg), formats)
     import json
+    if tpl:
+        written += write_layout_pdf(out, resume_stem, tpl, res["edits"], cfg)
+        (out / ".source").mkdir(exist_ok=True)
+        (out / ".source" / f"{resume_stem}.md").write_text(res["resume"], encoding="utf-8")
+    else:
+        written += write_doc(out, resume_stem, res["resume"],
+                             lambda p: resume_md_to_docx(res["resume"], p, cfg), formats, cfg)
     (out / ".source").mkdir(exist_ok=True)
     (out / ".source" / "application.json").write_text(json.dumps(
         {"company": company, "role": role, "resume_md": f"{resume_stem}.md", "letter_stem": letter_stem,
+         "letter_style": {k: letter_cfg[k] for k in ("font", "font_size", "accent") if k in letter_cfg},
+         "template": tpl.path if tpl else "", "formats": formats,
          "created": dt.datetime.now().isoformat(timespec="seconds")}, indent=2), encoding="utf-8")
     if "md" in formats:  # keep a copy in .source too so `letter` always finds the tailored resume
         (out / ".source" / f"{resume_stem}.md").write_text(res["resume"] + "\n", encoding="utf-8")
     letter_written = mode != "NO" and bool(res["cover_letter"])
     if letter_written:
-        written += write_doc(out, letter_stem, res["cover_letter"],
-                             lambda p: letter_to_docx(res["cover_letter"], res["resume"], p, cfg, company),
-                             formats)
+        written += save_letter(out, res["cover_letter"], cfg, note="first draft")
 
     print(f"\n✓ {role} at {company}\n  Saved to: {out}")
     for w in written:
@@ -695,31 +858,274 @@ def cmd_job(args, cfg):
         subprocess.run([opener, str(out)], check=False)
 
 
-def cmd_letter(args, cfg):
-    """Add a cover letter to an application folder made earlier, reusing its tailored resume."""
-    out = Path(args.folder).expanduser()
-    job_file = out / "job_description.txt"
-    if not job_file.exists():
-        sys.exit(f"No job_description.txt in {out}. Point this at a folder created by `tailor.py job`.")
+# ---------------------------------------------------------------- cover letters: versions & revisions
+
+
+def find_app(arg: str, cfg: dict) -> Path:
+    """Accept a full path, a folder name, part of a name ("atlassian"), or "latest"."""
+    p = Path(arg).expanduser()
+    if (p / "job_description.txt").exists():
+        return p
+    root = Path(cfg["output_root"]).expanduser()
+    if (root / arg / "job_description.txt").exists():
+        return root / arg
+    apps = sorted({j.parent for j in list(root.glob("*/job_description.txt")) + list(root.glob("*/*/job_description.txt"))},
+                  key=lambda d: (d / "job_description.txt").stat().st_mtime, reverse=True) if root.exists() else []
+    if arg.lower() in ("latest", "last", "recent"):
+        if apps:
+            print(f"Using the most recent application: {apps[0].name}")
+            return apps[0]
+    else:
+        words = [w for w in re.split(r"[\s_/-]+", arg.lower()) if w]
+        hits = [d for d in apps if all(w in str(d.relative_to(root)).lower() for w in words)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            print(f"Several applications match \"{arg}\"; using the most recent: {hits[0].name}")
+            for h in hits[1:6]:
+                print(f"   also: {h.name}")
+            return hits[0]
+    msg = f"Couldn't find an application folder called \"{arg}\" (looked in {root})."
+    if apps:
+        msg += "\nRecent applications:\n" + "\n".join(f"   {d.relative_to(root)}" for d in apps[:8])
+        msg += "\nYou can pass part of the name, e.g.  revise atlassian   or   revise latest"
+    sys.exit(msg)
+
+
+def load_app(out: Path, cfg: dict) -> tuple[dict, str, str]:
+    """(meta, tailored resume markdown, job description) for an application folder."""
     import json
+    if not (out / "job_description.txt").exists():
+        sys.exit(f"No job_description.txt in {out}. Point this at a folder created by `tailor.py job`.")
     meta_file = out / ".source" / "application.json"
-    meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+    meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
     src = out / ".source" / meta.get("resume_md", "-")
+    if not src.exists():  # older folders: find the saved tailored resume
+        label = re.sub(r"\s+", cfg.get("space", "_"), cfg["resume_label"]).lower()
+        found = [f for f in sorted((out / ".source").glob("*.md")) + sorted(out.glob("*.md"))
+                 if label in f.stem.lower() and "cover" not in f.stem.lower()]
+        src = found[0] if found else src
     resume_md = src.read_text(encoding="utf-8") if src.exists() else read_base(Path(cfg["base_resume"]).expanduser())
-    res = call_claude(resume_md, job_file.read_text(encoding="utf-8"), "YES", cfg,
+    return meta, resume_md, (out / "job_description.txt").read_text(encoding="utf-8")
+
+
+def _save_meta(out: Path, meta: dict):
+    import json
+    (out / ".source").mkdir(exist_ok=True)
+    (out / ".source" / "application.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _versions_dir(out: Path) -> Path:
+    d = out / ".source" / "cover_letter_versions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def letter_versions(out: Path) -> list[Path]:
+    return sorted(_versions_dir(out).glob("v*.md"), key=lambda p: int(p.stem[1:]))
+
+
+def letter_history(out: Path) -> list[dict]:
+    import json
+    f = _versions_dir(out) / "history.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+
+
+def save_letter(out: Path, text: str, cfg: dict, note: str = "", feedback: list | None = None) -> list[str]:
+    """Save a new version of the cover letter and (re)build the PDF."""
+    import json
+    meta, resume_md, _ = load_app(out, cfg)
+    company = meta.get("company", "")
+    stem = meta.get("letter_stem") or render_name(
+        cfg["file_name"], name_fields(cfg, resume_md, company, meta.get("role", "")), cfg,
+        doc=cfg["cover_letter_label"])
+    if not meta.get("letter_stem"):
+        meta["letter_stem"] = stem
+        (out / ".source" / "application.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    vdir = _versions_dir(out)
+    n = len(letter_versions(out)) + 1
+    (vdir / f"v{n}.md").write_text(text.strip() + "\n", encoding="utf-8")
+    hist = letter_history(out) + [{"version": n, "change": note, "feedback": feedback or [],
+                                   "time": dt.datetime.now().isoformat(timespec="seconds")}]
+    (vdir / "history.json").write_text(json.dumps(hist, indent=2), encoding="utf-8")
+    (out / ".source" / f"{stem}.md").write_text(text.strip() + "\n", encoding="utf-8")
+    return build_letter_files(out, stem, text, meta, resume_md, cfg)
+
+
+def build_letter_files(out: Path, stem: str, text: str, meta: dict, resume_md: str, cfg: dict) -> list[str]:
+    import pdf_template
+    formats = [f.lower() for f in meta.get("formats") or cfg["formats"]]
+    lcfg = {**cfg, **meta.get("letter_style", {})}
+    tpl = None
+    tpl_path = meta.get("template")
+    if tpl_path is None and cfg.get("match_layout", True):  # folder from an older version of the tool
+        base = Path(cfg.get("template_pdf") or cfg["base_resume"]).expanduser()
+        tpl_path = str(base) if base.suffix.lower() == ".pdf" else ""
+    if tpl_path and Path(tpl_path).exists():
+        tpl = pdf_template.Template(tpl_path)
+    name, contact, _ = split_header(resume_md)
+    if tpl:
+        name, contact = tpl.header()
+    date_text = dt.date.today().strftime("%B %d, %Y").replace(" 0", " ")
+    written = []
+    if "pdf" in formats or not formats:
+        missing = pdf_template.write_letter_pdf(out / f"{stem}.pdf", text, name, contact,
+                                                meta.get("company", ""), date_text, tpl, lcfg)
+        written.append(f"{stem}.pdf")
+        if missing:
+            print(f"  ! Font not installed: {', '.join(missing)}. The letter used a close look-alike; "
+                  f"install the font for an exact match.")
+    if "docx" in formats:
+        letter_to_docx(text, resume_md, out / f"{stem}.docx", lcfg, meta.get("company", ""))
+        written.append(f"{stem}.docx")
+    return written
+
+
+REVISE_PROMPT = """You revise a job-application cover letter based on the candidate's feedback.
+- Apply the new feedback precisely, and keep honoring the earlier feedback listed (don't undo it).
+- Change only what the feedback calls for; keep everything else as it is.
+- Facts must come from the resume, the job posting, or the candidate's feedback (the candidate may \
+give you new facts about themselves; use them). Never invent anything else.
+- Keep it 250-400 words unless the feedback asks for a different length. Plain paragraphs, no \
+address block; keep the greeting and the sign-off with the candidate's name.
+Reply with exactly:
+<cover_letter>...the full revised letter...</cover_letter>
+<changes>One or two short sentences on what you changed.</changes>"""
+
+
+def revise_letter(current: str, feedback: str, out: Path, resume_md: str, job: str, cfg: dict) -> tuple[str, str]:
+    hist = letter_history(out)
+    earlier = hist[-1].get("feedback", []) if hist else []  # feedback that led to the current version
+    user = (f"<resume>\n{resume_md}\n</resume>\n\n<job_posting>\n{job}\n</job_posting>\n\n"
+            f"<current_letter>\n{current}\n</current_letter>\n\n"
+            + ("<earlier_feedback>\n" + "\n".join(f"- {e}" for e in earlier) + "\n</earlier_feedback>\n\n"
+               if earlier else "")
+            + f"<new_feedback>\n{feedback}\n</new_feedback>")
+    text = _ask(REVISE_PROMPT, user, cfg, "Revising cover letter")
+    m = re.search(r"<cover_letter>(.*?)</cover_letter>", text, re.S)
+    if not m or not m.group(1).strip():
+        sys.exit("Claude didn't return a revised letter. Try rewording the feedback.")
+    c = re.search(r"<changes>(.*?)</changes>", text, re.S)
+    return m.group(1).strip(), (c.group(1).strip() if c else "")
+
+
+def _open(path: Path):
+    opener = {"darwin": "open", "win32": "explorer"}.get(sys.platform, "xdg-open")
+    subprocess.run([opener, str(path)], check=False)
+
+
+def cmd_letter(args, cfg):
+    """Write a cover letter for an application folder made earlier (or start over with --new)."""
+    out = find_app(args.folder, cfg)
+    meta, resume_md, job = load_app(out, cfg)
+    if args.model:
+        cfg["model"] = args.model
+    if letter_versions(out) and not args.new:
+        sys.exit(f"This application already has a cover letter.\n"
+                 f"  To improve it:      python tailor.py revise \"{out}\"\n"
+                 f"  To start over:      python tailor.py letter \"{out}\" --new")
+    res = call_claude(resume_md, job, "YES", {**cfg, **meta.get("letter_style", {})},
                       args.instructions or "", letter_only=True)
     if not res["cover_letter"]:
         sys.exit("Claude didn't return a cover letter. Try again, or add -i with more guidance.")
-    company = meta.get("company") or res["company"] or "Unknown"
-    stem = args.name or meta.get("letter_stem") or render_name(
-        cfg["file_name"], name_fields(cfg, resume_md, company, meta.get("role", "")), cfg,
-        doc=cfg["cover_letter_label"])
-    formats = [f.lower() for f in cfg["formats"]]
-    written = write_doc(out, stem, res["cover_letter"],
-                        lambda p: letter_to_docx(res["cover_letter"], resume_md, p, cfg, company), formats)
-    print(f"\n✓ Cover letter saved to: {out}")
+    note = "rewritten from scratch" if letter_versions(out) else "first draft"
+    written = save_letter(out, res["cover_letter"], cfg, note=note)
+    print(f"\n✓ Cover letter (version {len(letter_versions(out))}) saved to: {out}")
     for w in written:
         print(f"   - {w}")
+    print(f"\n  To refine it:  python tailor.py revise \"{out}\"")
+
+
+def cmd_revise(args, cfg):
+    """Improve the cover letter with feedback; one-shot or interactive. Every version is kept."""
+    out = find_app(args.folder, cfg)
+    meta, resume_md, job = load_app(out, cfg)
+    if args.model:
+        cfg["model"] = args.model
+    if args.feedback and " ".join(args.feedback).strip().lower() in ("revise", "letter", "interactive"):
+        args.feedback = []  # e.g. `revise <folder> revise --open`
+    versions = letter_versions(out)
+    if not versions:  # folder made by an earlier version of the tool: adopt its existing letter
+        label = re.sub(r"\s+", cfg.get("space", "_"), cfg["cover_letter_label"])
+        old = [f for f in sorted((out / ".source").glob("*.md")) + sorted(out.glob("*.md"))
+               if "cover" in f.stem.lower() or label.lower() in f.stem.lower()]
+        if old:
+            if not meta.get("letter_stem"):
+                meta["letter_stem"] = old[0].stem
+                _save_meta(out, meta)
+            save_letter(out, old[0].read_text(encoding="utf-8"), cfg, note="first draft")
+            versions = letter_versions(out)
+            meta, resume_md, job = load_app(out, cfg)
+    if not versions:
+        sys.exit(f"No cover letter yet. Create one first:  python tailor.py letter \"{out.name}\"")
+    hist = {h["version"]: h for h in letter_history(out)}
+
+    def show_list():
+        for v in versions:
+            n = int(v.stem[1:])
+            h = hist.get(n, {})
+            print(f"  v{n}  {h.get('time', '')[:16].replace('T', ' ')}  {h.get('change', '')}")
+
+    if args.list:
+        show_list(); return
+    if args.use:
+        src = _versions_dir(out) / f"v{args.use}.md"
+        if not src.exists():
+            sys.exit(f"No version {args.use}. Versions:"); 
+        old = next((h for h in letter_history(out) if h["version"] == args.use), {})
+        written = save_letter(out, src.read_text(encoding="utf-8"), cfg, note=f"restored v{args.use}",
+                              feedback=old.get("feedback", []))
+        print(f"✓ Restored version {args.use} as v{len(letter_versions(out))}: {', '.join(written)}")
+        return
+
+    current = versions[-1].read_text(encoding="utf-8")
+    pdf = out / f"{meta.get('letter_stem', '')}.pdf"
+
+    def one_round(feedback):
+        nonlocal current
+        new, changes = revise_letter(current, feedback, out, resume_md, job, cfg)
+        prior = (letter_history(out) or [{}])[-1].get("feedback", [])
+        save_letter(out, new, cfg, note=feedback, feedback=prior + [feedback])
+        current = new
+        print(f"\n✓ Saved version {len(letter_versions(out))}" + (f": {changes}" if changes else ""))
+        if args.open and pdf.exists():
+            _open(pdf)
+
+    if args.feedback:
+        one_round(" ".join(args.feedback))
+        print(f"  {pdf}")
+        return
+
+    # interactive
+    print(f"\n{'─' * 70}\n{current.strip()}\n{'─' * 70}")
+    print("Tell me what to change, e.g. \"warmer tone\", \"mention I led the 2024 migration\",\n"
+          "\"shorter, 3 paragraphs\". Commands: show, undo, versions, done (or just press Enter).")
+    while True:
+        try:
+            fb = input("\nfeedback> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); break
+        if fb.lower() in ("", "done", "q", "quit", "exit"):
+            break
+        if fb.lower() == "show":
+            print(f"\n{current.strip()}"); continue
+        if fb.lower() in ("versions", "list"):
+            versions = letter_versions(out); hist = {h["version"]: h for h in letter_history(out)}
+            show_list(); continue
+        if fb.lower() == "undo":
+            vs = letter_versions(out)
+            if len(vs) < 2:
+                print("  Nothing to undo."); continue
+            prev = vs[-2].read_text(encoding="utf-8")
+            old = next((h for h in letter_history(out) if h["version"] == int(vs[-2].stem[1:])), {})
+            save_letter(out, prev, cfg, note=f"restored v{vs[-2].stem[1:]}", feedback=old.get("feedback", []))
+            current = prev
+            print(f"  Back to the previous version (saved as v{len(letter_versions(out))}).")
+            continue
+        one_round(fb)
+        print(f"\n{'─' * 70}\n{current.strip()}\n{'─' * 70}")
+    print(f"\nFinal letter: {pdf}\nAll versions: {_versions_dir(out)}")
 
 
 def cmd_fetch(args, cfg):
@@ -751,6 +1157,16 @@ def cmd_import(args, cfg):
 def cmd_render(args, cfg):
     """Re-render an edited .md (resume or letter) to docx/pdf without calling Claude."""
     src = Path(args.file).expanduser()
+    if src.suffix.lower() == ".json":  # layout-matched resume: re-apply (edited) slot texts to the PDF
+        import json
+        import pdf_template
+        data = json.loads(src.read_text(encoding="utf-8"))
+        tpl = pdf_template.Template(data["template"])
+        dest = (src.parent.parent if src.parent.name == ".source" else src.parent) / \
+            (src.name.replace(".edits.json", "") + ".pdf")
+        over = tpl.render(data["edits"], dest)
+        print(f"✓ {dest}" + (f"\n  ! Set smaller to fit: {', '.join(over)}" if over else ""))
+        return
     md = src.read_text(encoding="utf-8")
     dest_dir = src.parent.parent if src.parent.name == ".source" else src.parent
     docx_path = dest_dir / (src.stem + ".docx")
@@ -760,7 +1176,11 @@ def cmd_render(args, cfg):
         base = Path(cfg["base_resume"]).expanduser()
         letter_to_docx(md, read_base(base) if base.exists() else "", docx_path, cfg, "")
     pdf = docx_to_pdf(docx_path)
-    print(f"✓ {docx_path}" + (f"\n✓ {pdf}" if pdf else ""))
+    if pdf and "docx" not in cfg["formats"]:
+        docx_path.unlink(missing_ok=True)
+        print(f"✓ {pdf}")
+    else:
+        print(f"✓ {docx_path}" + (f"\n✓ {pdf}" if pdf else "\n  ! Couldn't make a PDF (install LibreOffice)."))
 
 
 def main():
@@ -776,6 +1196,8 @@ def main():
     cl.add_argument("-n", "--no-cover-letter", action="store_true", help="never write a cover letter")
     j.add_argument("-i", "--instructions", help='extra guidance, e.g. "emphasize leadership"')
     j.add_argument("--base", help="base resume .md (default from config)")
+    j.add_argument("--template", help="PDF whose layout to copy (default: your base resume, if it's a PDF)")
+    j.add_argument("--simple", action="store_true", help="use the standard layout instead of your PDF's")
     j.add_argument("--model", help="Claude model id (default from config)")
     j.add_argument("--formats", help="comma list of docx,pdf,md (default from config)")
     j.add_argument("--open", action="store_true", help="open the output folder when done")
@@ -790,11 +1212,19 @@ def main():
     r = sub.add_parser("render", help="re-render an edited .md to .docx/.pdf (no API call)")
     r.add_argument("file")
 
-    lt = sub.add_parser("letter", help="add a cover letter to an existing application folder")
+    lt = sub.add_parser("letter", help="write a cover letter for an existing application folder")
     lt.add_argument("folder")
     lt.add_argument("-i", "--instructions", help="extra guidance for the letter")
+    lt.add_argument("--new", action="store_true", help="start over even if a letter exists")
     lt.add_argument("--model")
-    lt.add_argument("--name", help="exact file name (without extension) for the letter")
+
+    rv = sub.add_parser("revise", help="improve the cover letter with your feedback (keeps every version)")
+    rv.add_argument("folder", help="the application folder")
+    rv.add_argument("feedback", nargs="*", help='what to change; omit for an interactive session')
+    rv.add_argument("--list", action="store_true", help="list saved versions")
+    rv.add_argument("--use", type=int, help="restore version N")
+    rv.add_argument("--open", action="store_true", help="open the PDF after each revision")
+    rv.add_argument("--model")
 
     f = sub.add_parser("fetch", help="preview the text read from a listing URL (no API call)")
     f.add_argument("url")
@@ -804,7 +1234,7 @@ def main():
     if getattr(args, "model", None):
         cfg["model"] = args.model
     {"job": cmd_job, "import": cmd_import, "render": cmd_render,
-     "letter": cmd_letter, "fetch": cmd_fetch}[args.cmd](args, cfg)
+     "letter": cmd_letter, "revise": cmd_revise, "fetch": cmd_fetch}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

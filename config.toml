@@ -1,10 +1,16 @@
 # resume-tailor settings. Every value is optional; command-line flags override these.
 
-# Your master resume: a .md file (best), or a .pdf or .docx, e.g. "~/Documents/My_Resume.pdf"
-base_resume = "base_resume.md"
+# Your resume: a .pdf, .docx or .md file, e.g. "~/Documents/My_Resume.pdf"
+base_resume = "~/Desktop/Jobs and Resume/Ben_Piggot_Base_Resume.pdf"
+
+# Keep your PDF's design: when base_resume (or template_pdf) is a PDF, the tailored resume is
+# written into that same layout: same fonts, sizes, colors, columns, lines and spacing.
+match_layout = true
+# Optional: a different PDF whose layout to copy (e.g. if base_resume is a longer .md master list).
+template_pdf = ""
 
 # Where application folders are created when you don't pass --out.
-output_root = "~/Job Applications"
+output_root = "~/Desktop/Jobs and Resume/"
 
 # Cover letters: "auto" = only when the listing asks for or accepts one,
 # "yes" = always, "no" = never.  (-c / -n on the command line override this per job.)
@@ -28,8 +34,8 @@ cover_letter_label = "Cover Letter"
 # claude-sonnet-5-5 is fast and inexpensive; claude-opus-5-5 is the most capable.
 model = "claude-sonnet-5-5"
 
-# Output files to keep: any of "docx", "pdf", "md"
-formats = ["docx", "pdf"]
+# Output files to keep: any of "pdf", "docx", "md". Add "docx" for an editable Word copy.
+formats = ["pdf"]
 
 font = "Calibri"
 font_size = 10.5
